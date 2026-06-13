@@ -1,0 +1,255 @@
+diff --git a/scene/3d/audio_listener_3d.cpp b/scene/3d/audio_listener_3d.cpp
+index b855e9c206..a7270da8ca 100644
+--- a/scene/3d/audio_listener_3d.cpp
++++ b/scene/3d/audio_listener_3d.cpp
+@@ -54,6 +54,8 @@ bool AudioListener3D::_set(const StringName &p_name, const Variant &p_value) {
+ 		} else {
+ 			clear_current();
+ 		}
++	} else if (p_name == "solo") {
++		set_solo(p_value.operator bool());
+ 	} else {
+ 		return false;
+ 	}
+@@ -68,6 +70,8 @@ bool AudioListener3D::_get(const StringName &p_name, Variant &r_ret) const {
+ 		} else {
+ 			r_ret = is_current();
+ 		}
++	} else if (p_name == "solo") {
++		r_ret = is_solo();
+ 	} else {
+ 		return false;
+ 	}
+@@ -77,6 +81,7 @@ bool AudioListener3D::_get(const StringName &p_name, Variant &r_ret) const {
+ 
+ void AudioListener3D::_get_property_list(List<PropertyInfo> *p_list) const {
+ 	p_list->push_back(PropertyInfo(Variant::BOOL, PNAME("current")));
++	p_list->push_back(PropertyInfo(Variant::BOOL, PNAME("solo")));
+ }
+ 
+ void AudioListener3D::_update_listener() {
+@@ -128,6 +133,24 @@ void AudioListener3D::make_current() {
+ 		return;
+ 	}
+ 
++	// When solo is true (default), disable all other listeners first.
++	// This preserves backward compatibility — existing projects see no change.
++	// Directly set current=false rather than calling clear_current() on each
++	// to avoid cascading promotions via _audio_listener_3d_make_next_current().
++	if (solo) {
++		Node *root = get_tree()->get_root();
++		if (root) {
++			List<Node *> listeners;
++			_find_listeners(root, &listeners);
++			for (Node *node : listeners) {
++				AudioListener3D *listener = Object::cast_to<AudioListener3D>(node);
++				if (listener && listener != this && listener->current) {
++					listener->current = false;
++				}
++			}
++		}
++	}
++
+ 	get_viewport()->_audio_listener_3d_set(this);
+ }
+ 
+@@ -151,6 +174,32 @@ bool AudioListener3D::is_current() const {
+ 	}
+ }
+ 
++void AudioListener3D::set_solo(bool p_solo) {
++	if (solo == p_solo) {
++		return;
++	}
++	solo = p_solo;
++	// If solo is enabled and this listener is already current,
++	// enforce the solo behavior immediately to disable others.
++	if (solo && is_current()) {
++		make_current();
++	}
++}
++
++bool AudioListener3D::is_solo() const {
++	return solo;
++}
++
++void AudioListener3D::_find_listeners(Node *p_node, List<Node *> *r_list) {
++	AudioListener3D *listener = Object::cast_to<AudioListener3D>(p_node);
++	if (listener) {
++		r_list->push_back(p_node);
++	}
++	for (int i = 0; i < p_node->get_child_count(); i++) {
++		_find_listeners(p_node->get_child(i), r_list);
++	}
++}
++
+ void AudioListener3D::set_doppler_tracking(DopplerTracking p_tracking) {
+ 	if (doppler_tracking == p_tracking) {
+ 		return;
+@@ -177,7 +226,12 @@ void AudioListener3D::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_doppler_tracking", "mode"), &AudioListener3D::set_doppler_tracking);
+ 	ClassDB::bind_method(D_METHOD("get_doppler_tracking"), &AudioListener3D::get_doppler_tracking);
+ 
++	// Multi-listener (split-screen) bindings
++	ClassDB::bind_method(D_METHOD("set_solo", "enabled"), &AudioListener3D::set_solo);
++	ClassDB::bind_method(D_METHOD("is_solo"), &AudioListener3D::is_solo);
++
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "doppler_tracking", PROPERTY_HINT_ENUM, "Disabled,Idle,Physics"), "set_doppler_tracking", "get_doppler_tracking");
++	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "solo"), "set_solo", "is_solo");
+ 
+ 	BIND_ENUM_CONSTANT(DOPPLER_TRACKING_DISABLED);
+ 	BIND_ENUM_CONSTANT(DOPPLER_TRACKING_IDLE_STEP);
+diff --git a/scene/3d/audio_listener_3d.h b/scene/3d/audio_listener_3d.h
+index 3e40fa4fbb..275aba6de4 100644
+--- a/scene/3d/audio_listener_3d.h
++++ b/scene/3d/audio_listener_3d.h
+@@ -62,12 +62,22 @@ public:
+ 
+ 	Vector3 get_doppler_tracked_velocity() const;
+ 
++	// --- Multi-listener (split-screen) support ---
++	/// If ``true`` (default), enabling this listener disables all others.
++	/// Set to ``false`` to allow multiple simultaneous current listeners for split-screen audio.
++	void set_solo(bool p_solo);
++	bool is_solo() const;
++
++	/// Recursively collect all AudioListener3D nodes under *p_node*.
++	static void _find_listeners(Node *p_node, List<Node *> *r_list);
++
+ 	AudioListener3D();
+ 	~AudioListener3D();
+ 
+ private:
+ 	bool force_change = false;
+ 	bool current = false;
++	bool solo = true; // NEW: defaults true for backward compatibility
+ 
+ 	RID scenario_id;
+ 
+diff --git a/scene/3d/audio_stream_player_3d.cpp b/scene/3d/audio_stream_player_3d.cpp
+index f20d4d8e3e..bceb95b845 100644
+--- a/scene/3d/audio_stream_player_3d.cpp
++++ b/scene/3d/audio_stream_player_3d.cpp
+@@ -383,6 +383,22 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
+ 	Ref<World3D> world_3d = get_world_3d();
+ 	ERR_FAIL_COND_V(world_3d.is_null(), output_volume_vector);
+ 
++	// ---- Multi-listener (split-screen) support ----
++	// If an explicit listener_path is set, try to use that specific listener.
++	// This allows binding a sound (e.g. Player 2's engine) to a specific
++	// AudioListener3D, bypassing the camera iteration for spatialization.
++	AudioListener3D *explicit_listener = nullptr;
++	bool use_explicit_listener = false;
++	if (!listener_path.is_empty()) {
++		Node *node = get_node_or_null(listener_path);
++		if (node) {
++			explicit_listener = Object::cast_to<AudioListener3D>(node);
++			if (explicit_listener) {
++				use_explicit_listener = true;
++			}
++		}
++	}
++
+ 	HashSet<Camera3D *> cameras = world_3d->get_cameras();
+ 	cameras.insert(get_viewport()->get_camera_3d());
+ 
+@@ -402,11 +418,29 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
+ 			continue;
+ 		}
+ 
++		// Determine the listener node for this camera.
+ 		Node3D *listener_node = camera;
+ 
+-		AudioListener3D *listener = vp->get_audio_listener_3d();
+-		if (listener) {
+-			listener_node = listener;
++		// When an explicit listener_path is set, only process audio for that
++		// listener's camera/viewport. Skip all other cameras.
++		if (use_explicit_listener) {
++			// Check if this camera's viewport owns our explicit listener.
++			bool matches = (vp->get_audio_listener_3d() == explicit_listener);
++			// Also check: the explicit listener might be a child of this camera
++			// but not registered as the viewport's primary listener.
++			if (!matches && explicit_listener->get_viewport() == vp) {
++				matches = true;
++			}
++			if (!matches) {
++				continue;
++			}
++			listener_node = explicit_listener;
++		} else {
++			// Original behavior: use the viewport's registered listener, or fall back to camera.
++			AudioListener3D *listener = vp->get_audio_listener_3d();
++			if (listener) {
++				listener_node = listener;
++			}
+ 		}
+ 
+ 		Vector3 local_pos = listener_node->get_global_transform().orthonormalized().affine_inverse().xform(global_pos);
+@@ -510,8 +544,9 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
+ 		if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
+ 			Vector3 listener_velocity;
+ 
+-			if (listener) {
+-				listener_velocity = listener->get_doppler_tracked_velocity();
++			AudioListener3D *listener_ptr = Object::cast_to<AudioListener3D>(listener_node);
++			if (listener_ptr) {
++				listener_velocity = listener_ptr->get_doppler_tracked_velocity();
+ 			} else {
+ 				listener_velocity = camera->get_doppler_tracked_velocity();
+ 			}
+@@ -671,6 +706,14 @@ float AudioStreamPlayer3D::get_max_distance() const {
+ 	return max_distance;
+ }
+ 
++void AudioStreamPlayer3D::set_listener_path(const NodePath &p_path) {
++	listener_path = p_path;
++}
++
++NodePath AudioStreamPlayer3D::get_listener_path() const {
++	return listener_path;
++}
++
+ void AudioStreamPlayer3D::set_area_mask(uint32_t p_mask) {
+ 	area_mask = p_mask;
+ }
+@@ -883,6 +926,12 @@ void AudioStreamPlayer3D::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_playback_type", "playback_type"), &AudioStreamPlayer3D::set_playback_type);
+ 	ClassDB::bind_method(D_METHOD("get_playback_type"), &AudioStreamPlayer3D::get_playback_type);
+ 
++	// Multi-listener (split-screen) bindings
++	ClassDB::bind_method(D_METHOD("set_listener_path", "path"), &AudioStreamPlayer3D::set_listener_path);
++	ClassDB::bind_method(D_METHOD("get_listener_path"), &AudioStreamPlayer3D::get_listener_path);
++
++	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "listener_path"), "set_listener_path", "get_listener_path");
++
+ 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "stream", PROPERTY_HINT_RESOURCE_TYPE, "AudioStream"), "set_stream", "get_stream");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "attenuation_model", PROPERTY_HINT_ENUM, "Inverse,Inverse Square,Logarithmic,Disabled"), "set_attenuation_model", "get_attenuation_model");
+ 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "volume_db", PROPERTY_HINT_RANGE, "-80,80,suffix:dB"), "set_volume_db", "get_volume_db");
+diff --git a/scene/3d/audio_stream_player_3d.h b/scene/3d/audio_stream_player_3d.h
+index 07dee3c220..4efb1a1eb8 100644
+--- a/scene/3d/audio_stream_player_3d.h
++++ b/scene/3d/audio_stream_player_3d.h
+@@ -76,6 +76,8 @@ private:
+ 
+ 	AudioStreamPlayerInternal *internal = nullptr;
+ 
++	NodePath listener_path; // NEW: optional explicit listener binding
++
+ 	SafeNumeric<float> setplay{ -1.0 };
+ 	Ref<AudioStreamPlayback> setplayback;
+ 
+@@ -147,6 +149,13 @@ protected:
+ #endif // DISABLE_DEPRECATED
+ 
+ public:
++	// --- Multi-listener (split-screen) support ---
++	/// Optional explicit AudioListener3D path. When set, spatialization
++	/// is calculated relative to this specific listener. When empty,
++	/// falls back to the original viewport-listener behavior.
++	void set_listener_path(const NodePath &p_path);
++	NodePath get_listener_path() const;
++
+ 	void set_stream(Ref<AudioStream> p_stream);
+ 	Ref<AudioStream> get_stream() const;
+ 
