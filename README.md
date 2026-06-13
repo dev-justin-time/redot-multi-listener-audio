@@ -24,8 +24,16 @@ Two minimal, backward-compatible additions:
 
 | State | Behavior |
 |---|---|
-| `listener_path = NodePath()` (default empty) | Falls back to original behavior — spatialize relative to the viewport's current listener via the existing camera iteration loop. |
-| `listener_path = ^"Player2/Listener"` | Spatializes **only** relative to that specific `AudioListener3D`. Other listeners (e.g. Player 1's) are skipped for this sound. |
+| `listener_path = NodePath()` (default empty) | **Closest-listener fallback** — finds the geographically nearest current `AudioListener3D` across all viewports and spatializes relative to it. Falls back to the viewport's primary listener, then the active camera, if no current listeners exist. |
+| `listener_path = ^"Player2/Listener"` | Spatializes **only** relative to that specific `AudioListener3D`. Other listeners are skipped for this sound. |
+
+### 3. `Viewport.get_current_audio_listeners_3d()` (new C++ API)
+
+Internal method that iterates the viewport's registered `AudioListener3D` set and returns all nodes where `is_current()` returns true. Used by the closest-listener fallback in `AudioStreamPlayer3D._update_panning()`.
+
+### 4. `AudioListener3D.is_current()` fix
+
+Updated `is_current()` to recognize listeners with `current = true` and `solo = false` as "current" even when they are not the viewport's single primary listener. Previously, only the viewport's primary listener pointer was checked.
 
 ## Files Changed
 
@@ -34,7 +42,9 @@ Two minimal, backward-compatible additions:
 | `scene/3d/audio_listener_3d.h` | Added `solo` member (bool, default `true`), `set_solo()`, `is_solo()`, `_find_listeners()` |
 | `scene/3d/audio_listener_3d.cpp` | Modified `make_current()` to respect `solo`; added `set_solo()`, `is_solo()`, `_find_listeners()`; updated bindings |
 | `scene/3d/audio_stream_player_3d.h` | Added `listener_path` member (NodePath), `set_listener_path()`, `get_listener_path()` |
-| `scene/3d/audio_stream_player_3d.cpp` | Modified `_update_panning()` to use explicit listener when `listener_path` is set; added bindings |
+| `scene/3d/audio_stream_player_3d.cpp` | Modified `_update_panning()` to use explicit listener when `listener_path` is set; added closest-listener fallback when empty; added bindings |
+| `scene/main/viewport.h` | Added `get_current_audio_listeners_3d()` public method declaration |
+| `scene/main/viewport.cpp` | Implemented `get_current_audio_listeners_3d()` — iterates `audio_listener_3d_set` returning all current listeners |
 
 ## Usage Example (GDScript)
 

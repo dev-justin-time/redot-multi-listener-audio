@@ -1,5 +1,5 @@
 diff --git a/scene/3d/audio_listener_3d.cpp b/scene/3d/audio_listener_3d.cpp
-index b855e9c206..a7270da8ca 100644
+index b855e9c206..3f79d9b2d1 100644
 --- a/scene/3d/audio_listener_3d.cpp
 +++ b/scene/3d/audio_listener_3d.cpp
 @@ -54,6 +54,8 @@ bool AudioListener3D::_set(const StringName &p_name, const Variant &p_value) {
@@ -53,7 +53,23 @@ index b855e9c206..a7270da8ca 100644
  	get_viewport()->_audio_listener_3d_set(this);
  }
  
-@@ -151,6 +174,32 @@ bool AudioListener3D::is_current() const {
+@@ -145,12 +168,47 @@ void AudioListener3D::clear_current() {
+ 
+ bool AudioListener3D::is_current() const {
+ 	if (is_inside_tree() && !is_part_of_edited_scene()) {
+-		return get_viewport()->get_audio_listener_3d() == this;
++		// Primary listener check (works for single-listener setups).
++		if (get_viewport()->get_audio_listener_3d() == this) {
++			return true;
++		}
++		// Non-solo listener with current=true but not the viewport's primary.
++		// This happens in multi-listener split-screen setups where solo=false.
++		if (!solo && current) {
++			return true;
++		}
++		return false;
+ 	} else {
+ 		return current;
  	}
  }
  
@@ -86,7 +102,7 @@ index b855e9c206..a7270da8ca 100644
  void AudioListener3D::set_doppler_tracking(DopplerTracking p_tracking) {
  	if (doppler_tracking == p_tracking) {
  		return;
-@@ -177,7 +226,12 @@ void AudioListener3D::_bind_methods() {
+@@ -177,7 +235,12 @@ void AudioListener3D::_bind_methods() {
  	ClassDB::bind_method(D_METHOD("set_doppler_tracking", "mode"), &AudioListener3D::set_doppler_tracking);
  	ClassDB::bind_method(D_METHOD("get_doppler_tracking"), &AudioListener3D::get_doppler_tracking);
  
@@ -127,13 +143,15 @@ index 3e40fa4fbb..275aba6de4 100644
  	RID scenario_id;
  
 diff --git a/scene/3d/audio_stream_player_3d.cpp b/scene/3d/audio_stream_player_3d.cpp
-index f20d4d8e3e..bceb95b845 100644
+index f20d4d8e3e..c8f7615c35 100644
 --- a/scene/3d/audio_stream_player_3d.cpp
 +++ b/scene/3d/audio_stream_player_3d.cpp
-@@ -383,6 +383,22 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
+@@ -383,163 +383,206 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
  	Ref<World3D> world_3d = get_world_3d();
  	ERR_FAIL_COND_V(world_3d.is_null(), output_volume_vector);
  
+-	HashSet<Camera3D *> cameras = world_3d->get_cameras();
+-	cameras.insert(get_viewport()->get_camera_3d());
 +	// ---- Multi-listener (split-screen) support ----
 +	// If an explicit listener_path is set, try to use that specific listener.
 +	// This allows binding a sound (e.g. Player 2's engine) to a specific
@@ -149,56 +167,311 @@ index f20d4d8e3e..bceb95b845 100644
 +			}
 +		}
 +	}
-+
- 	HashSet<Camera3D *> cameras = world_3d->get_cameras();
- 	cameras.insert(get_viewport()->get_camera_3d());
  
-@@ -402,11 +418,29 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
- 			continue;
+-#ifndef PHYSICS_3D_DISABLED
+-	PhysicsDirectSpaceState3D *space_state = PhysicsServer3D::get_singleton()->space_get_direct_state(world_3d->get_space());
+-#endif // PHYSICS_3D_DISABLED
++	// ---- Multi-listener (split-screen) support ----
++	// Determine the target listener node.
++	// If listener_path is set, use that explicit listener.
++	// Otherwise, find the closest current listener across all viewports.
++	// This implements the "closest listener" fallback from proposal #116.
++	Node3D *listener_node = nullptr;
+ 
+-	for (Camera3D *camera : cameras) {
+-		if (!camera) {
+-			continue;
+-		}
+-		Viewport *vp = camera->get_viewport();
+-		if (!vp) {
+-			continue;
+-		}
+-		if (!vp->is_audio_listener_3d()) {
+-			continue;
++	if (use_explicit_listener && explicit_listener) {
++		listener_node = explicit_listener;
++	} else {
++		// Closest-listener fallback: find the current AudioListener3D
++		// that is geographically closest to this audio source.
++		real_t closest_dist = Math::INF;
++		AudioListener3D *closest_listener = nullptr;
++
++		// Iterate all viewport-registered listeners to find current ones.
++		List<AudioListener3D *> current_listeners;
++		get_viewport()->get_current_audio_listeners_3d(&current_listeners);
++
++		if (current_listeners.is_empty()) {
++			// Fall back to the viewport's primary listener if no current listeners.
++			AudioListener3D *primary = get_viewport()->get_audio_listener_3d();
++			if (primary) {
++				closest_listener = primary;
++			}
++		} else {
++			Vector3 source_pos = get_global_transform().origin;
++			for (AudioListener3D *listener : current_listeners) {
++				real_t dist = source_pos.distance_to(listener->get_global_transform().origin);
++				if (dist < closest_dist) {
++					closest_dist = dist;
++					closest_listener = listener;
++				}
++			}
  		}
  
-+		// Determine the listener node for this camera.
- 		Node3D *listener_node = camera;
- 
+-		Node3D *listener_node = camera;
+-
 -		AudioListener3D *listener = vp->get_audio_listener_3d();
 -		if (listener) {
 -			listener_node = listener;
-+		// When an explicit listener_path is set, only process audio for that
-+		// listener's camera/viewport. Skip all other cameras.
-+		if (use_explicit_listener) {
-+			// Check if this camera's viewport owns our explicit listener.
-+			bool matches = (vp->get_audio_listener_3d() == explicit_listener);
-+			// Also check: the explicit listener might be a child of this camera
-+			// but not registered as the viewport's primary listener.
-+			if (!matches && explicit_listener->get_viewport() == vp) {
-+				matches = true;
-+			}
-+			if (!matches) {
-+				continue;
-+			}
-+			listener_node = explicit_listener;
++		if (closest_listener) {
++			listener_node = closest_listener;
 +		} else {
-+			// Original behavior: use the viewport's registered listener, or fall back to camera.
-+			AudioListener3D *listener = vp->get_audio_listener_3d();
-+			if (listener) {
-+				listener_node = listener;
++			// Last resort: fall back to the viewport's camera.
++			Camera3D *cam = get_viewport()->get_camera_3d();
++			if (cam) {
++				listener_node = cam;
 +			}
  		}
++	}
  
- 		Vector3 local_pos = listener_node->get_global_transform().orthonormalized().affine_inverse().xform(global_pos);
-@@ -510,8 +544,9 @@ Vector<AudioFrame> AudioStreamPlayer3D::_update_panning() {
- 		if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
- 			Vector3 listener_velocity;
+-		Vector3 local_pos = listener_node->get_global_transform().orthonormalized().affine_inverse().xform(global_pos);
++	// If we still don't have a listener, return early.
++	if (!listener_node) {
++		return output_volume_vector;
++	}
+ 
+-		float dist = local_pos.length();
++	// Process audio relative to the resolved listener_node.
++	Vector3 local_pos = listener_node->get_global_transform().orthonormalized().affine_inverse().xform(global_pos);
+ 
+ #ifndef PHYSICS_3D_DISABLED
+-		Vector3 area_sound_pos;
+-		Vector3 listener_area_pos;
++	PhysicsDirectSpaceState3D *space_state = PhysicsServer3D::get_singleton()->space_get_direct_state(world_3d->get_space());
+ 
+-		Area3D *area = _get_overriding_area();
+-		if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
+-			area_sound_pos = space_state->get_closest_point_to_object_volume(area->get_rid(), listener_node->get_global_transform().origin);
+-			listener_area_pos = listener_node->get_global_transform().affine_inverse().xform(area_sound_pos);
+-		}
++	Vector3 area_sound_pos;
++	Vector3 listener_area_pos;
++
++	Area3D *area = _get_overriding_area();
++	if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
++		area_sound_pos = space_state->get_closest_point_to_object_volume(area->get_rid(), listener_node->get_global_transform().origin);
++		listener_area_pos = listener_node->get_global_transform().affine_inverse().xform(area_sound_pos);
++	}
+ #endif // PHYSICS_3D_DISABLED
+ 
+-		if (max_distance > 0) {
+-			float total_max = max_distance;
++	if (max_distance > 0) {
++		float total_max = max_distance;
+ 
+ #ifndef PHYSICS_3D_DISABLED
+-			if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
+-				total_max = MAX(total_max, listener_area_pos.length());
+-			}
++		if (area && area->is_using_reverb_bus() && area->get_reverb_uniformity() > 0) {
++			total_max = MAX(total_max, listener_area_pos.length());
++		}
+ #endif // PHYSICS_3D_DISABLED
+-			if (dist > total_max || total_max > max_distance) {
+-				if (!was_further_than_max_distance_last_frame) {
+-					HashMap<StringName, Vector<AudioFrame>> bus_volumes;
+-					for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
+-						// So the player gets muted and mostly stops mixing when out of range.
+-						AudioServer::get_singleton()->set_playback_bus_volumes_linear(playback, bus_volumes);
+-					}
+-					was_further_than_max_distance_last_frame = true; // Cache so we don't set the volume over and over.
++		if (local_pos.length() > total_max || total_max > max_distance) {
++			if (!was_further_than_max_distance_last_frame) {
++				HashMap<StringName, Vector<AudioFrame>> bus_volumes;
++				for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
++					// So the player gets muted and mostly stops mixing when out of range.
++					AudioServer::get_singleton()->set_playback_bus_volumes_linear(playback, bus_volumes);
+ 				}
+-				continue; //can't hear this sound in this listener
++				was_further_than_max_distance_last_frame = true;
+ 			}
++			return output_volume_vector;
+ 		}
+-		was_further_than_max_distance_last_frame = false;
++	}
++	was_further_than_max_distance_last_frame = false;
+ 
+-		float multiplier = Math::db_to_linear(_get_attenuation_db(dist));
+-		if (max_distance > 0) {
+-			multiplier *= MAX(0, 1.0 - (dist / max_distance));
+-		}
++	float multiplier = Math::db_to_linear(_get_attenuation_db(local_pos.length()));
++	if (max_distance > 0) {
++		multiplier *= MAX(0, 1.0 - (local_pos.length() / max_distance));
++	}
+ 
+-		float db_att = (1.0 - MIN(1.0, multiplier)) * attenuation_filter_db;
++	float db_att = (1.0 - MIN(1.0, multiplier)) * attenuation_filter_db;
+ 
+-		if (emission_angle_enabled) {
+-			Vector3 listenertopos = global_pos - listener_node->get_global_transform().origin;
+-			float c = listenertopos.normalized().dot(get_global_transform().basis.get_column(2).normalized()); //it's z negative
+-			float angle = Math::rad_to_deg(Math::acos(c));
+-			if (angle > emission_angle) {
+-				db_att -= -emission_angle_filter_attenuation_db;
+-			}
++	if (emission_angle_enabled) {
++		Vector3 listenertopos = global_pos - listener_node->get_global_transform().origin;
++		float c = listenertopos.normalized().dot(get_global_transform().basis.get_column(2).normalized()); //it's z negative
++		float angle = Math::rad_to_deg(Math::acos(c));
++		if (angle > emission_angle) {
++			db_att -= -emission_angle_filter_attenuation_db;
+ 		}
++	}
+ 
+-		linear_attenuation = Math::db_to_linear(db_att);
+-		for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
+-			AudioServer::get_singleton()->set_playback_highshelf_params(playback, linear_attenuation, attenuation_filter_cutoff_hz);
+-		}
++	linear_attenuation = Math::db_to_linear(db_att);
++	for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
++		AudioServer::get_singleton()->set_playback_highshelf_params(playback, linear_attenuation, attenuation_filter_cutoff_hz);
++	}
+ 
+-		if (AudioServer::get_singleton()->get_speaker_mode() == AudioServer::SPEAKER_MODE_STEREO) {
+-			output_volume_vector.write[0] = _calc_output_vol_stereo(local_pos, cached_global_panning_strength * panning_strength);
+-			output_volume_vector.write[1] = AudioFrame(0, 0);
+-			output_volume_vector.write[2] = AudioFrame(0, 0);
+-			output_volume_vector.write[3] = AudioFrame(0, 0);
+-		} else {
+-			// Bake in a constant factor here to allow the project setting defaults for 2d and 3d to be normalized to 1.0.
+-			float tightness = cached_global_panning_strength * 2.0f;
+-			tightness *= panning_strength;
+-			_calc_output_vol(local_pos.normalized(), tightness, output_volume_vector);
+-		}
++	if (AudioServer::get_singleton()->get_speaker_mode() == AudioServer::SPEAKER_MODE_STEREO) {
++		output_volume_vector.write[0] = _calc_output_vol_stereo(local_pos, cached_global_panning_strength * panning_strength);
++		output_volume_vector.write[1] = AudioFrame(0, 0);
++		output_volume_vector.write[2] = AudioFrame(0, 0);
++		output_volume_vector.write[3] = AudioFrame(0, 0);
++	} else {
++		// Bake in a constant factor here to allow the project setting defaults for 2d and 3d to be normalized to 1.0.
++		float tightness = cached_global_panning_strength * 2.0f;
++		tightness *= panning_strength;
++		_calc_output_vol(local_pos.normalized(), tightness, output_volume_vector);
++	}
+ 
+-		for (unsigned int k = 0; k < 4; k++) {
+-			output_volume_vector.write[k] = multiplier * output_volume_vector[k];
+-		}
++	for (unsigned int k = 0; k < 4; k++) {
++		output_volume_vector.write[k] = multiplier * output_volume_vector[k];
++	}
+ 
+-		HashMap<StringName, Vector<AudioFrame>> bus_volumes;
++	HashMap<StringName, Vector<AudioFrame>> bus_volumes;
+ #ifndef PHYSICS_3D_DISABLED
+-		if (area) {
+-			if (area->is_overriding_audio_bus()) {
+-				//override audio bus
+-				bus_volumes[area->get_audio_bus_name()] = output_volume_vector;
+-			}
+-
+-			if (area->is_using_reverb_bus()) {
+-				StringName reverb_bus_name = area->get_reverb_bus_name();
+-				Vector<AudioFrame> reverb_vol;
+-				_calc_reverb_vol(area, listener_area_pos, output_volume_vector, reverb_vol);
+-				bus_volumes[reverb_bus_name] = reverb_vol;
+-			}
+-		} else
+-#endif // PHYSICS_3D_DISABLED
+-		{
+-			bus_volumes[internal->bus] = output_volume_vector;
++	if (area) {
++		if (area->is_overriding_audio_bus()) {
++			//override audio bus
++			bus_volumes[area->get_audio_bus_name()] = output_volume_vector;
+ 		}
+ 
+-		for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
+-			AudioServer::get_singleton()->set_playback_bus_volumes_linear(playback, bus_volumes);
++		if (area->is_using_reverb_bus()) {
++			StringName reverb_bus_name = area->get_reverb_bus_name();
++			Vector<AudioFrame> reverb_vol;
++			_calc_reverb_vol(area, listener_area_pos, output_volume_vector, reverb_vol);
++			bus_volumes[reverb_bus_name] = reverb_vol;
+ 		}
++	} else
++#endif // PHYSICS_3D_DISABLED
++	{
++		bus_volumes[internal->bus] = output_volume_vector;
++	}
+ 
+-		if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
+-			Vector3 listener_velocity;
++	for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
++		AudioServer::get_singleton()->set_playback_bus_volumes_linear(playback, bus_volumes);
++	}
  
 -			if (listener) {
 -				listener_velocity = listener->get_doppler_tracked_velocity();
-+			AudioListener3D *listener_ptr = Object::cast_to<AudioListener3D>(listener_node);
-+			if (listener_ptr) {
-+				listener_velocity = listener_ptr->get_doppler_tracked_velocity();
- 			} else {
- 				listener_velocity = camera->get_doppler_tracked_velocity();
+-			} else {
+-				listener_velocity = camera->get_doppler_tracked_velocity();
+-			}
++	if (doppler_tracking != DOPPLER_TRACKING_DISABLED) {
++		Vector3 listener_velocity;
++
++		AudioListener3D *listener_ptr = Object::cast_to<AudioListener3D>(listener_node);
++		if (listener_ptr) {
++			listener_velocity = listener_ptr->get_doppler_tracked_velocity();
++		} else {
++			listener_velocity = Vector3();
++		}
+ 
+-			Vector3 local_velocity = listener_node->get_global_transform().orthonormalized().basis.xform_inv(linear_velocity - listener_velocity);
++		Vector3 local_velocity = listener_node->get_global_transform().orthonormalized().basis.xform_inv(linear_velocity - listener_velocity);
+ 
+-			if (local_velocity != Vector3()) {
+-				float approaching = local_pos.normalized().dot(local_velocity.normalized());
+-				float velocity = local_velocity.length();
+-				float speed_of_sound = 343.0;
++		if (local_velocity != Vector3()) {
++			float approaching = local_pos.normalized().dot(local_velocity.normalized());
++			float velocity = local_velocity.length();
++			float speed_of_sound = 343.0;
+ 
+-				float doppler_pitch_scale = internal->pitch_scale * speed_of_sound / (speed_of_sound + velocity * approaching);
+-				doppler_pitch_scale = CLAMP(doppler_pitch_scale, (1 / 8.0), 8.0); //avoid crazy stuff
++			float doppler_pitch_scale = internal->pitch_scale * speed_of_sound / (speed_of_sound + velocity * approaching);
++			doppler_pitch_scale = CLAMP(doppler_pitch_scale, (1 / 8.0), 8.0); //avoid crazy stuff
+ 
+-				actual_pitch_scale = doppler_pitch_scale;
+-			} else {
+-				actual_pitch_scale = internal->pitch_scale;
+-			}
++			actual_pitch_scale = doppler_pitch_scale;
+ 		} else {
+ 			actual_pitch_scale = internal->pitch_scale;
+ 		}
+-		for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
+-			AudioServer::get_singleton()->set_playback_pitch_scale(playback, actual_pitch_scale);
+-			if (playback->get_is_sample()) {
+-				Ref<AudioSamplePlayback> sample_playback = playback->get_sample_playback();
+-				if (sample_playback.is_valid()) {
+-					AudioServer::get_singleton()->update_sample_playback_pitch_scale(sample_playback, actual_pitch_scale);
+-				}
++	} else {
++		actual_pitch_scale = internal->pitch_scale;
++	}
++	for (Ref<AudioStreamPlayback> &playback : internal->stream_playbacks) {
++		AudioServer::get_singleton()->set_playback_pitch_scale(playback, actual_pitch_scale);
++		if (playback->get_is_sample()) {
++			Ref<AudioSamplePlayback> sample_playback = playback->get_sample_playback();
++			if (sample_playback.is_valid()) {
++				AudioServer::get_singleton()->update_sample_playback_pitch_scale(sample_playback, actual_pitch_scale);
  			}
-@@ -671,6 +706,14 @@ float AudioStreamPlayer3D::get_max_distance() const {
+ 		}
+ 	}
+@@ -671,6 +714,14 @@ float AudioStreamPlayer3D::get_max_distance() const {
  	return max_distance;
  }
  
@@ -213,7 +486,7 @@ index f20d4d8e3e..bceb95b845 100644
  void AudioStreamPlayer3D::set_area_mask(uint32_t p_mask) {
  	area_mask = p_mask;
  }
-@@ -883,6 +926,12 @@ void AudioStreamPlayer3D::_bind_methods() {
+@@ -883,6 +934,12 @@ void AudioStreamPlayer3D::_bind_methods() {
  	ClassDB::bind_method(D_METHOD("set_playback_type", "playback_type"), &AudioStreamPlayer3D::set_playback_type);
  	ClassDB::bind_method(D_METHOD("get_playback_type"), &AudioStreamPlayer3D::get_playback_type);
  
@@ -252,4 +525,36 @@ index 07dee3c220..4efb1a1eb8 100644
 +
  	void set_stream(Ref<AudioStream> p_stream);
  	Ref<AudioStream> get_stream() const;
+ 
+diff --git a/scene/main/viewport.cpp b/scene/main/viewport.cpp
+index 756399624d..2b2a8ff75e 100644
+--- a/scene/main/viewport.cpp
++++ b/scene/main/viewport.cpp
+@@ -4362,6 +4362,13 @@ AudioListener3D *Viewport::get_audio_listener_3d() const {
+ 	ERR_READ_THREAD_GUARD_V(nullptr);
+ 	return audio_listener_3d;
+ }
++nvoid Viewport::get_current_audio_listeners_3d(List<AudioListener3D *> *r_listeners) const {
++	for (AudioListener3D *listener : audio_listener_3d_set) {
++		if (listener->is_current()) {
++			r_listeners->push_back(listener);
++		}
++	}
++}
+ 
+ void Viewport::set_as_audio_listener_3d(bool p_enable) {
+ 	ERR_MAIN_THREAD_GUARD;
+diff --git a/scene/main/viewport.h b/scene/main/viewport.h
+index 022f5dd402..e20f03d9eb 100644
+--- a/scene/main/viewport.h
++++ b/scene/main/viewport.h
+@@ -854,6 +854,9 @@ private:
+ 
+ public:
+ 	AudioListener3D *get_audio_listener_3d() const;
++	/// Populate *r_listeners with all AudioListener3D nodes in this viewport
++	/// whose is_current() returns true (supports multi-listener setups).
++	void get_current_audio_listeners_3d(List<AudioListener3D *> *r_listeners) const;
+ 	void set_as_audio_listener_3d(bool p_enable);
+ 	bool is_audio_listener_3d() const;
  
