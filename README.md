@@ -44,7 +44,13 @@ Updated `is_current()` to recognize listeners with `current = true` and `solo = 
 | `scene/3d/audio_stream_player_3d.h` | Added `listener_path` member (NodePath), `set_listener_path()`, `get_listener_path()` |
 | `scene/3d/audio_stream_player_3d.cpp` | Modified `_update_panning()` to use explicit listener when `listener_path` is set; added closest-listener fallback when empty; added bindings |
 | `scene/main/viewport.h` | Added `get_current_audio_listeners_3d()` public method declaration |
-| `scene/main/viewport.cpp` | Implemented `get_current_audio_listeners_3d()` — iterates `audio_listener_3d_set` returning all current listeners |
+| `scene/main/viewport.cpp` | Implemented `get_current_audio_listeners_3d()` — walks parent viewport hierarchy collecting all current listeners |
+| `tests/test_main.cpp` | Registered `test_audio_stream_player_3d.h` include |
+| `tests/scene/test_audio_stream_player_3d.h` | New unit test: 6 subcases covering `solo`, `solo=false` multi-listener, closest-listener distance math, `listener_path` override, mixed solo settings, and a smoke test calling `_update_panning()` via test subclass |
+
+### Viewport Hierarchy Traversal
+
+`get_current_audio_listeners_3d()` now walks **up** the viewport parent chain (child SubViewport → parent → root). This ensures an `AudioStreamPlayer3D` inside a nested SubViewport finds listeners from its own SubViewport AND any ancestor viewports — critical for split-screen where each SubViewport has its own `AudioListener3D` with `solo=false`.
 
 ## Usage Example (GDScript)
 

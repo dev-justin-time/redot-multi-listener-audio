@@ -1,3 +1,4 @@
+warning: in the working copy of 'scene/main/viewport.cpp', CRLF will be replaced by LF the next time Git touches it
 diff --git a/scene/3d/audio_listener_3d.cpp b/scene/3d/audio_listener_3d.cpp
 index b855e9c206..3f79d9b2d1 100644
 --- a/scene/3d/audio_listener_3d.cpp
@@ -527,18 +528,26 @@ index 07dee3c220..4efb1a1eb8 100644
  	Ref<AudioStream> get_stream() const;
  
 diff --git a/scene/main/viewport.cpp b/scene/main/viewport.cpp
-index 756399624d..2b2a8ff75e 100644
+index 756399624d..f96db5656d 100644
 --- a/scene/main/viewport.cpp
 +++ b/scene/main/viewport.cpp
-@@ -4362,6 +4362,13 @@ AudioListener3D *Viewport::get_audio_listener_3d() const {
+@@ -4362,6 +4362,21 @@ AudioListener3D *Viewport::get_audio_listener_3d() const {
  	ERR_READ_THREAD_GUARD_V(nullptr);
  	return audio_listener_3d;
  }
 +nvoid Viewport::get_current_audio_listeners_3d(List<AudioListener3D *> *r_listeners) const {
-+	for (AudioListener3D *listener : audio_listener_3d_set) {
-+		if (listener->is_current()) {
-+			r_listeners->push_back(listener);
++	// Walk the viewport hierarchy (child SubViewports -> parent viewports)
++	// to collect all current AudioListener3D nodes. This ensures that
++	// an AudioStreamPlayer3D in any viewport in the hierarchy can find
++	// listeners from sibling/descendant SubViewport partitions.
++	const Viewport *vp = this;
++	while (vp) {
++		for (AudioListener3D *listener : vp->audio_listener_3d_set) {
++			if (listener->is_current()) {
++				r_listeners->push_back(listener);
++			}
 +		}
++		vp = vp->parent;
 +	}
 +}
  
@@ -558,3 +567,15 @@ index 022f5dd402..e20f03d9eb 100644
  	void set_as_audio_listener_3d(bool p_enable);
  	bool is_audio_listener_3d() const;
  
+diff --git a/tests/test_main.cpp b/tests/test_main.cpp
+index 3eb74332ee..744f447dc0 100644
+--- a/tests/test_main.cpp
++++ b/tests/test_main.cpp
+@@ -181,6 +181,7 @@
+ #include "tests/scene/test_primitives.h"
+ #include "tests/scene/test_skeleton_3d.h"
+ #include "tests/scene/test_sky.h"
++#include "tests/scene/test_audio_stream_player_3d.h"
+ #endif // _3D_DISABLED
+ 
+ #ifndef PHYSICS_3D_DISABLED
